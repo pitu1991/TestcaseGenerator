@@ -1,0 +1,19 @@
+# VectorDB TC server config. Copy to config.yaml and edit project_root.
+# Everything else derives from project_root unless you override it.
+
+# Point this at your project folder. On the current machine that is e.g.
+# C:\Users\snaraya4\Desktop\Project  -- but it is NOT hardcoded in code.
+project_root: "C:/Users/snaraya4/Desktop/Project"
+
+embedding_model: "BAAI/bge-small-en-v1.5"
+chunk_size: 400          # must be <= model max_seq_length (512 for bge-small); auto-clamped
+chunk_overlap: 80
+
+default_top_k: 10
+token_budget: 35000      # host-LLM context budget (approx tokens)
+rerank: false            # Phase 1 off; enable if retrieval precision is weak
+
+pii_guard: true          # lightweight SSN/account redaction at ingest; disable only if corpus is confirmed clean
+
+log_level: "INFO"
+log_file: "vectordb-server.log"

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "jira-mcp": {
+      "command": "python",
+      "args": ["/absolute/path/to/project_root/jira-mcp/server.py"]
+    },
+    "vectordb-tc": {
+      "command": "python",
+      "args": ["/absolute/path/to/vectordb_tc/server.py"],
+      "env": {
+        "VECTORDB_PROJECT_ROOT": "/absolute/path/to/project_root"
+      }
+    }
+  }
+}

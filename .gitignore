@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Local config (contains machine-specific paths — use config.example.yaml as template)
+vectordb_tc/config.yaml
+
+# Local MCP wiring (contains absolute paths — use mcp.example.json as template)
+vectordb_tc/mcp.json
+
+# ChromaDB data directory
+vectordb-data/
+
+# HuggingFace model cache (large, downloaded on first run)
+.cache/
+
+# Exported test case output
+User Stories/
+
+# Logs
+*.log
+
+# Claude Code IDE settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

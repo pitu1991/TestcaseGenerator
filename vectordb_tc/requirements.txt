@@ -1,0 +1,12 @@
+# Runtime
+chromadb>=0.5,<2
+sentence-transformers>=3.0
+openpyxl>=3.1
+mcp>=1.2            # provides mcp.server.fastmcp.FastMCP
+pyyaml>=6.0         # only needed if you load config from YAML
+
+# Dev / tests
+pytest>=8.0
+
+# Note: versions are conservative lower bounds. Pin exact versions in your repo
+# after a clean install on the target Windows machine.
