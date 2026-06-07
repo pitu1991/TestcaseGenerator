@@ -7,6 +7,7 @@ Two fixes vs the design:
    header row repeated in each sub-chunk (Req 1.4)."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 
@@ -36,20 +37,33 @@ class Chunker:
         return self.embedder.count_tokens(text)
 
     def chunk_document(self, text: str, base_meta: dict) -> list[Chunk]:
-        pieces: list[str] = []
+        # Track the nearest heading so each chunk records its section (best-effort).
+        pieces: list[tuple[str, str]] = []   # (section, text)
+        current_section = base_meta.get("document_title", "")
         for block in self._split_structural(text):
+            current_section = self._heading_of(block) or current_section
             if self._is_table(block):
-                pieces.extend(self._chunk_table(block))
+                parts = self._chunk_table(block)
             elif block.startswith("```"):
-                pieces.append(block)  # keep code fences atomic
+                parts = [block]  # keep code fences atomic
             elif self._ntok(block) <= self.max_tokens:
-                pieces.append(block)
+                parts = [block]
             else:
-                pieces.extend(self._token_split(block))
+                parts = self._token_split(block)
+            pieces.extend((current_section, p) for p in parts)
 
-        pieces = [p for p in (s.strip() for s in pieces) if p]
+        pieces = [(sec, p) for sec, p in ((s, t.strip()) for s, t in pieces) if p]
         total = len(pieces)
-        return [self._mk_chunk(p, i, total, base_meta) for i, p in enumerate(pieces)]
+        return [self._mk_chunk(p, i, total, base_meta, sec)
+                for i, (sec, p) in enumerate(pieces)]
+
+    @staticmethod
+    def _heading_of(block: str) -> str:
+        """Return the first heading text in a block (without leading #), else ''."""
+        for line in block.splitlines():
+            if _HEADING.match(line):
+                return line.lstrip("#").strip()
+        return ""
 
     # --- structural splitting ------------------------------------------------
     def _split_structural(self, text: str) -> list[str]:
@@ -101,9 +115,12 @@ class Chunker:
             out.append(" ".join(words[i:i + win]))
         return out
 
-    def _mk_chunk(self, text: str, idx: int, total: int, base: dict) -> Chunk:
+    def _mk_chunk(self, text: str, idx: int, total: int, base: dict, section: str = "") -> Chunk:
+        version = int(base.get("version", 1))
         return Chunk(
-            id=f"{base['content_hash'][:12]}_{idx}",
+            # Version-suffixed so a content revert to an earlier version cannot
+            # collide with that version's retained (is_latest=False) chunk ids.
+            id=f"{base['content_hash'][:12]}_{idx}_v{version}",
             text=text,
             source_path=base["source_path"],
             document_title=base.get("document_title", ""),
@@ -115,4 +132,11 @@ class Chunker:
             embedding_model=base["embedding_model"],
             model_version=base["model_version"],
             metadata=base.get("metadata", {}),
+            document_id=base.get("document_id", ""),
+            version=version,
+            is_latest=base.get("is_latest", True),
+            module=base.get("module", "default"),
+            section=section,
+            chunk_hash=hashlib.sha256(text.encode()).hexdigest(),
+            authority_score=int(base.get("authority_score", 0)),
         )

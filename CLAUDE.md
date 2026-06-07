@@ -68,7 +68,7 @@ Config: pytest.ini sets python_classes = *Tests for test discovery.
 python vectordb_tc/server.py
 ```
 
-The server exposes 8 MCP tools.
+The server exposes 19 MCP tools (Phases A–D).
 
 ### Kiro MCP Wiring
 
@@ -118,11 +118,13 @@ Defines all data classes shared across the system:
 - TestCase / TestStep: output test case structure
 - ValidationResult / ValidationError: export validation report
 - IngestionResult: result of a single file/epic ingest
-- Category: enum of knowledge types (MOM, UI_Flow, Error_Code, Business_Rule, Q_and_A, Story, Test_Case)
+- Category: enum of knowledge types (MOM, UI_Flow, Error_Code, Business_Rule, Q_and_A, Story, Test_Case, Business_Resolution)
+- ConflictRecord / ResolutionArtifact (Phase C governance); DocumentDelta / DeltaSection (Phase B); AUTHORITY_DEFAULTS map + authority_for() (Business_Resolution=100 down to MOM/Q_and_A=40)
 
 #### config.py — Configuration Management
 - AppConfig: dataclass with YAML/JSON loader; all paths derive from project_root
 - Defaults: embedding_model=BAAI/bge-small-en-v1.5, chunk_size=400, token_budget=35000, pii_guard=True
+- Versioning/governance: max_versions_retained=0 (unlimited), conflict_detection=False, conflict_similarity_threshold=0.83, project_id="default"; governance_db_path derives to {project_root}/governance.db
 - Lazy import of pyyaml (JSON-only setups don't require it)
 
 #### embedder.py — Sentence-Transformers Wrapper
@@ -142,6 +144,7 @@ Defines all data classes shared across the system:
 - IngestionPipeline: coordinates chunking, embedding, and store operations
 - Local files: `SUPPORTED_TEXT = {".md", ".txt", ".json"}` — **xlsx is NOT general knowledge**; Excel files are only parsed as test cases via `ingest_test_cases()`. Dropping an .xlsx into KnowledgeBase will be silently skipped by `ingest_directory()`.
 - Change detection: SHA256 content hash; re-ingest only if hash differs (not mtime)
+- **Versioning (Phase A, Option B):** all ingestion routes through `_store_versioned()`. New document → v1; unchanged hash → skip; changed hash → flip prior chunks to `is_latest=false` (**never deleted**) and insert the next version. `document_id` (path relative to `knowledge_dir`, or `jira:{key}`) is the stable anchor across versions; `module` resolves as explicit param > top-level folder > `"default"`. Retention: `max_versions_retained` config (0 = unlimited). See [docs/phase_a_versioning_design.md](vectordb_tc/docs/phase_a_versioning_design.md).
 - Jira integration: fetches stories/epics, normalizes Jira issue dicts, flattens ADF → text
 - PII guard (default ON): redacts SSN and bank account patterns; logging redaction count but not values
 - Model-change detection: signals if embedding model differs from stored chunks (requires full re-index)
@@ -157,6 +160,7 @@ Defines all data classes shared across the system:
 
 #### retrieval.py — Hybrid Search & Context Assembly
 - RetrievalEngine: combines dense + keyword retrieval via Reciprocal Rank Fusion (RRF)
+- **`is_latest=true` is the default filter** (`_with_latest()` merges it via ChromaDB `$and`); historical versions are opt-in via `include_historical=True`. This is the single guard against version-pollution — keep it default-on; never query `_col` directly outside `store.py`.
 - Hybrid scoring: RRF formula 1 / (k + rank + 1) per list (k=60); chunks in both lists score highest
 - Keyword extraction: domain identifiers (error codes, issue keys, CamelCase field names)
 - gather_context(): assembles a ContextBundle within token budget
@@ -189,10 +193,30 @@ Defines all data classes shared across the system:
 - Issue normalization: maps raw Jira issue dicts to ingestion-friendly format
 - TODO mappings: three function names need mapping to your Jira server (marked in code)
 
+#### delta.py — Delta Generation (Phase B)
+- DeltaEngine.diff_versions(): section-level diff between two versions using per-chunk `chunk_hash` grouped by `section` (previous→latest by default). Emits DocumentDelta of added/changed/removed sections so only impacted test cases are regenerated. Single-version docs report all sections as `added` (from_version=0).
+
+#### governance.py — Conflict & Resolution Store (Phase C)
+- GovernanceStore: SQLite (stdlib, `{project_root}/governance.db`). `conflicts` table (suspected→confirmed/dismissed→resolved; unordered `pair_key` dedup) + `resolutions` table. Portable to Postgres later with no code change.
+- The LLM/server never decide truth here: detection writes `suspected`, the host LLM adjudicates via `record_verdict`, a human approves the resolution.
+
+#### conflict.py — Conflict Candidate Detection (Phase C)
+- ConflictDetector.scan(): pure-similarity (no LLM) candidate generation at ingest — finds cross-document latest chunks above `conflict_similarity_threshold` and records suspected conflicts. Skips `Business_Resolution` chunks. Gated by `conflict_detection` (default off). Fires the Notifier on creation.
+
+#### notifier.py — Notifications (Phase D)
+- Notifier interface + LogNotifier (default placeholder, logs) + NullNotifier. Wired into ConflictDetector; swap for Email/Slack later with no call-site change.
+
+#### review_app.py — Human-in-the-Loop Review UI (Phase D)
+- stdlib `http.server`, localhost-only, no auth. ReviewService holds all (unit-tested, socket-free) logic; the HTTP handler is a thin adapter. resolve_fn/verdict_fn are injected to decouple from ingestion/governance. Launched via the `start_review_ui` MCP tool on a daemon thread.
+
 #### server.py — FastMCP Entry Point
 - Wires 8 tools and returns STRUCTURED errors (empty KB, Jira unavailable, validation failures)
-- Globals: CONFIG, EMBEDDER, STORE, CHUNKER, INGEST, RETRIEVE, EXPORTER, VALIDATOR
-- Tools: ingest_documents, ingest_jira_stories, search_knowledge, gather_test_context, export_test_cases, get_ingestion_status, list_stories_without_tests, remove_source
+- Globals: CONFIG, EMBEDDER, STORE, CHUNKER, GOVERNANCE, DETECTOR, INGEST, RETRIEVE, DELTA, EXPORTER, VALIDATOR
+- Core tools: ingest_documents, ingest_jira_stories, search_knowledge, gather_test_context, export_test_cases, get_ingestion_status, list_stories_without_tests, remove_source, migrate_versioning
+- Delta (Phase B): get_document_versions, search_delta_changes, gather_delta_context
+- Governance (Phase C): get_conflicts, get_conflict_candidates, record_conflict_verdict, resolve_conflict, search_authoritative_knowledge, search_unresolved_conflicts
+- Review UI (Phase D): start_review_ui (launches the localhost review app on a daemon thread)
+- **`migrate_versioning` is a one-time, idempotent backfill** (`STORE.backfill_versioning()`) that stamps `version`/`is_latest`/`document_id`/`chunk_hash` on pre-Phase-A chunks. Run it once after upgrading, BEFORE relying on `is_latest` filtering — otherwise un-stamped chunks (missing the field) get filtered out and retrieval returns empty.
 - **Two-tool workflow:** `gather_test_context` appends an `instruction_block` and `template_spec` to its JSON response telling the host LLM to produce test cases and then call `export_test_cases`. This is how the server directs generation without doing it itself — the instruction is baked into the tool response, not into a system prompt.
 
 ### Coupling & Design Decisions
@@ -209,8 +233,8 @@ Defines all data classes shared across the system:
 
 ### Change Detection & Idempotency
 - Content hash: Every source (file or Jira story) is hashed and stored in chunk metadata
-- Skip unchanged: If hash matches stored hash, ingest is skipped (fast re-runs)
-- Replace on change: If hash differs, old chunks deleted and new ones stored (no orphans)
+- Skip unchanged: If hash matches the latest stored hash, ingest is skipped (fast re-runs)
+- **Versioned on change (Option B):** If hash differs, prior chunks are flipped to `is_latest=false` (retained for history/audit, not deleted) and a new version is inserted. `remove_source` purges all versions; `sync` still purges chunks whose backing file disappeared.
 
 ### Token Budgeting
 - Retrieval engine caps context per category: few-shot gets 1/3 of budget, error codes get 1/5, etc.

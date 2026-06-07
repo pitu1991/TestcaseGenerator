@@ -26,17 +26,55 @@ class RetrievalEngine:
     def __init__(self, embedder: EmbeddingService, store: ChromaStore, config: AppConfig):
         self.embedder, self.store, self.config = embedder, store, config
 
-    def search(self, query: str, filters: dict | None = None, top_k: int | None = None) -> list[SearchResult]:
+    def search(self, query: str, filters: dict | None = None, top_k: int | None = None,
+               include_historical: bool = False, authority_boost: bool = False) -> list[SearchResult]:
         top_k = top_k or self.config.default_top_k
         if self.store.get_stats()["total_chunks"] == 0:
             raise EmptyKnowledgeBase("knowledge base empty - run ingestion first")
 
-        dense = self.store.search(self.embedder.embed_query(query), top_k=top_k * 2, where=filters)
+        where = self._with_latest(filters, include_historical)
+        dense = self.store.search(self.embedder.embed_query(query), top_k=top_k * 2, where=where)
         keyword: list[SearchResult] = []
         for term in self._extract_keywords(query):
-            keyword.extend(self.store.keyword_search(term, top_k=top_k))
+            keyword.extend(self.store.keyword_search(term, top_k=top_k, where=where))
         fused = self._rrf([dense, keyword])
+        if authority_boost:
+            fused = self._apply_authority(fused)
         return fused[:top_k]
+
+    @staticmethod
+    def _apply_authority(results: list[SearchResult]) -> list[SearchResult]:
+        """Re-rank by source authority (Phase C governance): a Business_Resolution
+        (score 100) outranks a Story (80) outranks an MOM (40) at equal relevance.
+        Multiplies fused score by (1 + authority/100) and re-sorts."""
+        for r in results:
+            a = getattr(r.chunk, "authority_score", 0) or 0
+            r.relevance_score = round(r.relevance_score * (1 + a / 100.0), 6)
+        return sorted(results, key=lambda r: r.relevance_score, reverse=True)
+
+    @staticmethod
+    def _with_latest(filters: dict | None, include_historical: bool) -> dict | None:
+        """Inject is_latest=True by default. Historical search is opt-in. ChromaDB
+        requires $and to combine conditions; we flatten an existing $and rather than
+        nesting (ChromaDB does not accept nested $and)."""
+        if include_historical:
+            return filters or None
+        latest = {"is_latest": True}
+        if not filters:
+            return latest
+        if "$and" in filters and isinstance(filters["$and"], list):
+            return {"$and": filters["$and"] + [latest]}
+        return {"$and": [filters, latest]}
+
+    def relevant_test_cases(self, query: str, issue_key: str | None = None,
+                            top_k: int = 8) -> list[SearchResult]:
+        """Existing Test_Case chunks most relevant to a query (used for delta
+        regeneration: what already exists that the change might affect)."""
+        if issue_key:
+            filters = {"$and": [{"category": "Test_Case"}, {"issue_key": issue_key}]}
+        else:
+            filters = {"category": "Test_Case"}
+        return self.search_filtered(query, filters, top_k)
 
     def gather_context(self, description: str, acceptance_criteria, issue_key=None,
                        token_budget: int | None = None, linked_issues=None) -> ContextBundle:

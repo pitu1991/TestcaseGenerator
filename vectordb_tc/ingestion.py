@@ -18,7 +18,7 @@ from pathlib import Path
 from chunker import Chunker
 from config import AppConfig
 from embedder import EmbeddingService
-from models import Chunk, IngestionResult
+from models import Chunk, IngestionResult, authority_for
 from store import ChromaStore
 
 SUPPORTED_TEXT = {".md", ".txt", ".json"}
@@ -45,16 +45,57 @@ def redact_pii(text: str) -> tuple[str, int]:
 
 class IngestionPipeline:
     def __init__(self, config: AppConfig, chunker: Chunker,
-                 embedder: EmbeddingService, store: ChromaStore):
+                 embedder: EmbeddingService, store: ChromaStore,
+                 conflict_detector=None):
         self.config, self.chunker, self.embedder, self.store = config, chunker, embedder, store
+        # Optional Phase C hook; when set and config.conflict_detection is on, each
+        # ingest scans freshly stored chunks for similarity conflicts.
+        self.conflict_detector = conflict_detector
 
     # --- model-change guard --------------------------------------------------
     def model_needs_reindex(self) -> bool:
         versions = {v for v in self.store.stored_model_versions() if v}
         return bool(versions) and versions != {self.embedder.model_version}
 
+    # --- versioned store (Phase A state machine) -----------------------------
+    def _store_versioned(self, source: str, document_id: str, content_hash: str,
+                         text: str, category: str, extra: dict, module: str,
+                         title: str, t0: float, redactions: int = 0,
+                         force: bool = False) -> IngestionResult:
+        """Option B: never delete on update. New doc -> v1. Unchanged -> skip.
+        Changed -> flip prior latest to is_latest=False and insert the next version."""
+        latest = self.store.latest_version_for_document(document_id)
+        if not force and latest is not None and latest[1] == content_hash:
+            return IngestionResult(True, source, document_id=document_id, version=latest[0],
+                                   skipped_unchanged=True, redactions=redactions,
+                                   duration_ms=int((time.time() - t0) * 1000))
+
+        version = 1 if latest is None else latest[0] + 1
+        if latest is not None:
+            self.store.mark_not_latest(document_id)
+
+        base = self._base_meta(source, title, content_hash, category, extra,
+                               document_id, version, module)
+        chunks = self.chunker.chunk_document(text, base)
+        embeddings = self._embed_and_store(chunks)
+
+        if self.conflict_detector is not None and self.config.conflict_detection and chunks:
+            # Never let detection failures break ingestion.
+            try:
+                self.conflict_detector.scan(chunks, embeddings)
+            except Exception:  # noqa: BLE001
+                pass
+
+        if self.config.max_versions_retained and self.config.max_versions_retained > 0:
+            self.store.prune_old_versions(document_id, self.config.max_versions_retained)
+
+        return IngestionResult(True, source, document_id=document_id, version=version,
+                               chunks_created=len(chunks), redactions=redactions,
+                               duration_ms=int((time.time() - t0) * 1000))
+
     # --- local files ---------------------------------------------------------
-    def ingest_file(self, file_path: str, category: str = "auto", force: bool = False) -> IngestionResult:
+    def ingest_file(self, file_path: str, category: str = "auto",
+                    module: str = "auto", force: bool = False) -> IngestionResult:
         t0 = time.time()
         p = Path(file_path)
         try:
@@ -63,29 +104,23 @@ class IngestionPipeline:
             return IngestionResult(False, file_path, errors=[f"read failed: {e}"])
 
         content_hash = hashlib.sha256(raw).hexdigest()
-        if not force and self.store.hash_for_source(str(p)) == content_hash:
-            return IngestionResult(True, str(p), skipped_unchanged=True,
-                                   duration_ms=int((time.time() - t0) * 1000))
-
         text = raw.decode("utf-8", errors="replace")
         redactions = 0
         if self.config.pii_guard:
             text, redactions = redact_pii(text)
 
-        base = self._base_meta(str(p), p.stem, content_hash,
-                               self._auto_category(p, category), {})
-        chunks = self.chunker.chunk_document(text, base)
-        deleted = self.store.delete_by_source(str(p))     # replace, don't orphan
-        self._embed_and_store(chunks)
-        return IngestionResult(True, str(p), chunks_created=len(chunks),
-                               chunks_deleted=deleted, redactions=redactions,
-                               duration_ms=int((time.time() - t0) * 1000))
+        return self._store_versioned(
+            str(p), self._document_id_for_file(p), content_hash, text,
+            self._auto_category(p, category), {}, self._module_for_file(p, module),
+            p.stem, t0, redactions, force,
+        )
 
-    def ingest_directory(self, dir_path: str, category: str = "auto") -> list[IngestionResult]:
+    def ingest_directory(self, dir_path: str, category: str = "auto",
+                         module: str = "auto") -> list[IngestionResult]:
         results = []
         for f in Path(dir_path).rglob("*"):
             if f.suffix.lower() in SUPPORTED_TEXT:
-                results.append(self.ingest_file(str(f), category))
+                results.append(self.ingest_file(str(f), category, module))
             elif f.suffix.lower() == ".xlsx":
                 results.extend(self.ingest_test_cases(str(f)))
         return results
@@ -105,16 +140,11 @@ class IngestionPipeline:
             content_hash = hashlib.sha256(
                 f"{xlsx_path}:{ws.title}:{text}".encode()).hexdigest()
             source = f"{xlsx_path}#{ws.title}"
-            if self.store.hash_for_source(source) == content_hash:
-                results.append(IngestionResult(True, source, skipped_unchanged=True))
-                continue
-            base = self._base_meta(source, ws.title, content_hash, "Test_Case",
-                                   {"issue_key": issue_key} if issue_key else {})
-            chunks = self.chunker.chunk_document(text, base)
-            deleted = self.store.delete_by_source(source)
-            self._embed_and_store(chunks)
-            results.append(IngestionResult(True, source, chunks_created=len(chunks),
-                                           chunks_deleted=deleted))
+            extra = {"issue_key": issue_key} if issue_key else {}
+            results.append(self._store_versioned(
+                source, source, content_hash, text, "Test_Case", extra,
+                "default", ws.title, time.time(),
+            ))
         return results
 
     # --- jira ----------------------------------------------------------------
@@ -211,37 +241,66 @@ class IngestionPipeline:
 
         content_hash = hashlib.sha256(text.encode()).hexdigest()
         source = f"jira:{issue_key}"
-        if self.store.hash_for_source(source) == content_hash:
-            return IngestionResult(True, source, skipped_unchanged=True,
-                                   duration_ms=int((time.time() - t0) * 1000))
-
         meta = {
             "issue_key": issue_key, "epic_key": epic_key,
             "assignee": story.get("assignee", ""), "status": story.get("status", ""),
         }
-        base = self._base_meta(source, story.get("summary") or issue_key,
-                               content_hash, "Story", meta)
-        chunks = self.chunker.chunk_document(text, base)
-        deleted = self.store.delete_by_source(source)
-        self._embed_and_store(chunks)
-        return IngestionResult(True, source, chunks_created=len(chunks),
-                               chunks_deleted=deleted, redactions=redactions,
-                               duration_ms=int((time.time() - t0) * 1000))
+        return self._store_versioned(
+            source, source, content_hash, text, "Story", meta, "default",
+            story.get("summary") or issue_key, t0, redactions,
+        )
+
+    # --- resolutions (Phase C) ----------------------------------------------
+    def ingest_resolution(self, text: str, resolution_id: str, module: str = "default",
+                          extra: dict | None = None) -> IngestionResult:
+        """Re-ingest a human-approved resolution as a high-authority chunk so
+        retrieval prioritizes it over the original conflicting sources."""
+        content_hash = hashlib.sha256(text.encode()).hexdigest()
+        source = f"resolution:{resolution_id}"
+        return self._store_versioned(
+            source, source, content_hash, text, "Business_Resolution",
+            extra or {}, module, f"Resolution {resolution_id}", time.time(),
+        )
 
     # --- helpers -------------------------------------------------------------
-    def _embed_and_store(self, chunks: list[Chunk]) -> None:
+    def _embed_and_store(self, chunks: list[Chunk]) -> list[list[float]]:
         if not chunks:
-            return
+            return []
         embeddings = self.embedder.embed_texts([c.text for c in chunks])
         self.store.upsert_chunks(chunks, embeddings)
+        return embeddings
 
-    def _base_meta(self, source, title, content_hash, category, extra) -> dict:
+    def _base_meta(self, source, title, content_hash, category, extra,
+                   document_id, version, module) -> dict:
         return {
             "source_path": source, "document_title": title, "content_hash": content_hash,
             "category": category, "ingestion_timestamp": _now(),
             "embedding_model": self.embedder.model_name,
-            "model_version": self.embedder.model_version, "metadata": extra,
+            "model_version": self.embedder.model_version,
+            "document_id": document_id, "version": version, "is_latest": True,
+            "module": module, "authority_score": authority_for(category),
+            "metadata": extra,
         }
+
+    def _document_id_for_file(self, p: Path) -> str:
+        """Stable logical identity across versions: POSIX path relative to
+        knowledge_dir, else the absolute POSIX path if outside it."""
+        try:
+            return p.resolve().relative_to(Path(self.config.knowledge_dir).resolve()).as_posix()
+        except (ValueError, OSError):
+            return p.resolve().as_posix()
+
+    def _module_for_file(self, p: Path, module: str) -> str:
+        """Explicit param wins; else the first folder under knowledge_dir; else default."""
+        if module and module != "auto":
+            return module
+        try:
+            rel = p.resolve().relative_to(Path(self.config.knowledge_dir).resolve())
+            if len(rel.parts) > 1:
+                return rel.parts[0]
+        except (ValueError, OSError):
+            pass
+        return "default"
 
     @staticmethod
     def _auto_category(path: Path, category: str) -> str:

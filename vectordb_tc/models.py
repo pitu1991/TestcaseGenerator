@@ -14,19 +14,37 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 # Single source of truth for categories. Test_Case was missing in the design.
+# Business_Resolution (Phase C) is the authoritative artifact a human approves to
+# settle a conflict; it outranks every source category during retrieval.
 Category = Literal[
-    "MOM", "UI_Flow", "Error_Code", "Business_Rule", "Q_and_A", "Story", "Test_Case"
+    "MOM", "UI_Flow", "Error_Code", "Business_Rule", "Q_and_A", "Story", "Test_Case",
+    "Business_Resolution",
 ]
 CATEGORIES: tuple[str, ...] = (
     "MOM", "UI_Flow", "Error_Code", "Business_Rule", "Q_and_A", "Story", "Test_Case",
+    "Business_Resolution",
 )
 
 CaseType = Literal["positive", "negative", "edge"]
 
+# Default per-category authority used by governance ranking. Higher = more trusted.
+# Stamped on every chunk so the metadata schema is stable.
+AUTHORITY_DEFAULTS: dict[str, int] = {
+    "Business_Resolution": 100,
+    "Story": 80, "Business_Rule": 80,
+    "UI_Flow": 70, "Error_Code": 70,
+    "Test_Case": 60,
+    "MOM": 40, "Q_and_A": 40,
+}
+
+
+def authority_for(category: str) -> int:
+    return AUTHORITY_DEFAULTS.get(category, 50)
+
 
 @dataclass
 class Chunk:
-    id: str                    # "{content_hash[:12]}_{chunk_index}"
+    id: str                    # "{content_hash[:12]}_{chunk_index}_v{version}"
     text: str
     source_path: str           # file path or "jira:{issue_key}"
     document_title: str
@@ -38,6 +56,15 @@ class Chunk:
     embedding_model: str       # e.g. "BAAI/bge-small-en-v1.5"
     model_version: str         # model revision/dim signature; forces re-index on change
     metadata: dict = field(default_factory=dict)  # epic_key, issue_key, assignee, ...
+    # --- versioning (Phase A) ------------------------------------------------
+    document_id: str = ""      # stable logical identity across versions (the anchor)
+    version: int = 1           # monotonic per document_id, starts at 1
+    is_latest: bool = True     # default retrieval filter; old versions flip to False
+    module: str = "default"    # coarse grouping (e.g. "Authentication")
+    section: str = ""          # nearest heading the chunk came from (best-effort)
+    chunk_hash: str = ""       # sha256 of THIS chunk's text (Phase B delta detection)
+    superseded_at: str = ""    # ISO 8601 when this chunk lost is_latest (audit)
+    authority_score: int = 0   # governance ranking weight (Phase C)
 
 
 @dataclass
@@ -88,6 +115,7 @@ class TestCase:
     ac_ids: list[str]          # which acceptance criteria this case covers (traceability)
     case_type: CaseType        # positive | negative | edge  (reliable coverage check)
     citations: list[str]       # source chunk ids that grounded this case
+    resolution_ids: list[str] = field(default_factory=list)  # governance traceability (Phase C)
     workplace_capability: str = ""
     priority: str = ""
     status: str = "Not Run"
@@ -112,9 +140,59 @@ class ValidationResult:
 
 
 @dataclass
+class DeltaSection:
+    section: str               # heading the change belongs to
+    change: str                # "added" | "removed" | "changed"
+    old_text: str = ""
+    new_text: str = ""
+
+
+@dataclass
+class DocumentDelta:
+    document_id: str
+    from_version: int          # 0 when there is no prior version (all added)
+    to_version: int
+    sections: list[DeltaSection]      # only the sections that differ
+    unchanged_sections: list[str]
+
+
+@dataclass
+class ConflictRecord:
+    conflict_id: str
+    project_id: str
+    module: str
+    status: str                # suspected | confirmed | dismissed | resolved
+    priority: str              # low | medium | high
+    created_at: str            # ISO 8601
+    chunk_a_id: str
+    chunk_b_id: str
+    source_a: str
+    source_b: str
+    similarity: float
+    assigned_reviewer: str = ""
+    rationale: str = ""        # filled by the host LLM's adjudication
+    resolution_id: str = ""
+
+
+@dataclass
+class ResolutionArtifact:
+    resolution_id: str
+    conflict_id: str
+    decision: str              # source_a | source_b | merge | new_rule
+    text: str                  # the authoritative statement humans approved
+    approver: str
+    authority_level: int
+    effective_date: str
+    created_at: str
+    resolution_chunk_id: str = ""   # document_id of the re-ingested resolution chunk
+
+
+@dataclass
 class IngestionResult:
     success: bool
     source_path: str
+    document_id: str = ""
+    version: int = 0
     chunks_created: int = 0
     chunks_updated: int = 0
     chunks_deleted: int = 0

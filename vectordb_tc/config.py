@@ -30,6 +30,16 @@ class AppConfig:
 
     pii_guard: bool = True             # lightweight SSN/bank guard, default on (Req 12.2)
 
+    # Versioning (Phase A). 0 = keep unlimited history (local default); set > 0 to
+    # prune the oldest versions of a document beyond this many most-recent versions.
+    max_versions_retained: int = 0
+
+    # Governance (Phase C). Conflict detection is OFF by default: it adds a
+    # similarity query per ingested chunk. Turn on once the corpus is multi-source.
+    conflict_detection: bool = False
+    conflict_similarity_threshold: float = 0.83   # cosine score to flag a candidate
+    project_id: str = "default"                    # multi-project scoping for conflicts
+
     log_level: str = "INFO"
     log_file: str = "vectordb-server.log"
 
@@ -49,6 +59,10 @@ class AppConfig:
     @property
     def jira_server_path(self) -> str:
         return str(Path(self.project_root) / "jira-mcp" / "server.py")
+
+    @property
+    def governance_db_path(self) -> str:
+        return str(Path(self.project_root) / "governance.db")
 
     @classmethod
     def from_file(cls, path: str) -> "AppConfig":

@@ -19,6 +19,10 @@ vectordb_tc/mcp.json
 # ChromaDB data directory
 vectordb-data/
 
+# Governance SQLite DB (conflicts/resolutions — local runtime data)
+governance.db
+*.db
+
 # HuggingFace model cache (large, downloaded on first run)
 .cache/
 

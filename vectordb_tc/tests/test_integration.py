@@ -31,6 +31,9 @@ sentence_transformers = pytest.importorskip(
 from config import AppConfig
 from embedder import EmbeddingService
 from chunker import Chunker
+from conflict import ConflictDetector
+from delta import DeltaEngine
+from governance import GovernanceStore
 from store import ChromaStore
 from ingestion import IngestionPipeline
 from retrieval import RetrievalEngine
@@ -153,6 +156,9 @@ def test_pii_redacted_before_store(pipeline, tmp_project, store):
     pipeline.ingest_file(str(pii_file))
     results = store.keyword_search("123-45-6789", top_k=5)
     assert not results, "Raw SSN should not appear in the store after redaction"
+    # Clean up both the file AND its chunks: this is a module-scoped shared store,
+    # so a leftover orphan would skew chunk-count deltas in later sync tests.
+    store.delete_by_source(str(pii_file))
     pii_file.unlink()
 
 
@@ -242,3 +248,76 @@ def test_sync_purges_orphaned_chunks(pipeline, store, tmp_project):
 
     assert store.hash_for_source(str(orphan)) is None, \
         "sync should have deleted chunks for the removed file"
+
+
+def test_versioning_latest_only_by_default(pipeline, store, retriever, tmp_project):
+    """Option B end-to-end against real ChromaDB: v2 supersedes v1, default search
+    returns only the latest, and include_historical surfaces both (validates the
+    $and is_latest filter the FakeStore can't exercise)."""
+    kb = tmp_project / "KnowledgeBase"
+    doc = kb / "otp_flow.md"
+
+    doc.write_text("# OTP\nLogin requires OTP validation via an SMS token.",
+                   encoding="utf-8")
+    assert pipeline.ingest_file(str(doc)).version == 1
+    doc.write_text("# OTP\nLogin requires CAPTCHA then OTP validation via an SMS token.",
+                   encoding="utf-8")
+    assert pipeline.ingest_file(str(doc)).version == 2
+
+    # Default: only the latest version is visible.
+    latest = retriever.search("OTP login validation token", top_k=10)
+    otp = [h for h in latest if h.chunk.document_id == "otp_flow.md"]
+    assert otp, "latest OTP chunk should be retrievable"
+    assert all(h.chunk.is_latest and h.chunk.version == 2 for h in otp)
+    assert any("CAPTCHA" in h.chunk.text for h in otp)
+
+    # Opt-in: both versions visible.
+    hist = retriever.search("OTP login validation token", top_k=10, include_historical=True)
+    versions = {h.chunk.version for h in hist if h.chunk.document_id == "otp_flow.md"}
+    assert versions == {1, 2}
+
+    store.delete_by_source(str(doc))   # purge all versions (shared module store)
+    doc.unlink()
+
+
+def test_conflict_detection_and_resolution_end_to_end(embedder, tmp_project):
+    """Phase C against real embeddings + SQLite: two contradictory docs from
+    different sources get flagged, a human resolution is re-ingested as a
+    high-authority artifact, and authoritative search surfaces it on top."""
+    root = tmp_project / "conflict_run"
+    root.mkdir()
+    cfg = AppConfig(project_root=str(root), chunk_size=200, chunk_overlap=40,
+                    pii_guard=False, conflict_detection=True,
+                    conflict_similarity_threshold=0.7)
+    store = ChromaStore(str(root / "vectordb-data"))
+    gov = GovernanceStore(":memory:")
+    detector = ConflictDetector(store, gov, cfg.conflict_similarity_threshold, cfg.project_id)
+    chunker = Chunker(embedder, cfg.chunk_size, cfg.chunk_overlap)
+    pipe = IngestionPipeline(cfg, chunker, embedder, store, conflict_detector=detector)
+    retr = RetrievalEngine(embedder, store, cfg)
+
+    kb = root / "KnowledgeBase"
+    kb.mkdir()
+    (kb / "design.md").write_text(
+        "# OTP\nOTP validation is required for login.", encoding="utf-8")
+    (kb / "requirement.md").write_text(
+        "# OTP\nOTP validation is not required for login.", encoding="utf-8")
+    pipe.ingest_file(str(kb / "design.md"))
+    pipe.ingest_file(str(kb / "requirement.md"))
+
+    conflicts = gov.get_conflicts(status="suspected")
+    assert conflicts, "similar cross-document chunks should be flagged as suspected"
+
+    c = conflicts[0]
+    assert gov.record_verdict(c.conflict_id, True, "required vs not required")
+
+    rid = "res001"
+    res_text = "For login, OTP validation is required only for external users."
+    ing = pipe.ingest_resolution(res_text, rid, module=c.module,
+                                 extra={"conflict_id": c.conflict_id})
+    gov.create_resolution(c.conflict_id, "new_rule", res_text, "qa", 100,
+                          resolution_chunk_id=ing.document_id, resolution_id=rid)
+    assert gov.get_conflict(c.conflict_id).status == "resolved"
+
+    top = retr.search("is OTP validation required for login", top_k=5, authority_boost=True)
+    assert top and top[0].chunk.category == "Business_Resolution"
