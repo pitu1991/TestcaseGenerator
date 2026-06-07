@@ -22,6 +22,7 @@ from governance import GovernanceStore
 from notifier import LogNotifier, Notifier
 from retrieval import RetrievalEngine
 from review_app import ReviewService
+from failure import FailureAnalyzer
 from ingestion import IngestionPipeline, redact_pii
 from jira_client import adf_to_text
 from config import AppConfig
@@ -565,6 +566,126 @@ def test_detector_notifies_on_conflict():
     det = ConflictDetector(StubStore(), gov, threshold=0.83, notifier=RecordingNotifier())
     created = det.scan([_chunk_v("a1", "A")], [[0.1] * 8])
     assert len(created) == 1 and seen == [created[0].conflict_id]
+
+
+# --- Phase E: failure intelligence -------------------------------------------
+class FakeFailureStore:
+    """In-memory store for the failure analyzer (no ChromaDB). `score` controls
+    what search() returns so threshold gating is deterministic."""
+
+    def __init__(self, score: float = 0.9):
+        self.chunks: dict[str, Chunk] = {}
+        self.score = score
+
+    def get_stats(self):
+        return {"total_chunks": len(self.chunks), "by_category": {}}
+
+    def upsert_chunks(self, chunks, embeddings):
+        for c in chunks:
+            self.chunks[c.id] = c
+
+    def get_chunks_by_ids(self, ids):
+        return [self.chunks[i] for i in ids if i in self.chunks]
+
+    def update_chunk_metadata(self, chunk_id, updates):
+        c = self.chunks.get(chunk_id)
+        if c is None:
+            return False
+        c.metadata.update({k: v for k, v in updates.items() if v is not None})
+        return True
+
+    def chunks_by_category(self, category, where_extra=None):
+        return [c for c in self.chunks.values() if c.category == category]
+
+    def search(self, emb, top_k=10, where=None):
+        cs = [c for c in self.chunks.values() if c.category == "Failure"]
+        return [SearchResult(c, self.score, "dense") for c in cs][:top_k]
+
+
+def _analyzer(store=None, threshold=0.85):
+    return FailureAnalyzer(FakeEmbedder(), store or FakeFailureStore(),
+                           AppConfig(failure_similarity_threshold=threshold))
+
+
+def test_record_failure_creates_failure_chunk():
+    store = FakeFailureStore()
+    art = _analyzer(store).record_failure("test_login", "TimeoutError on #submit",
+                                          "trace...", run_id="42")
+    assert art.failure_id.startswith("fail_")
+    assert art.occurrences == 1 and art.first_seen and art.last_seen
+    c = store.chunks[art.failure_id]
+    assert c.category == "Failure" and c.is_latest
+    assert c.metadata["test_name"] == "test_login" and c.metadata["run_id"] == "42"
+
+
+def test_identical_failure_increments_occurrences():
+    store = FakeFailureStore()
+    fa = _analyzer(store)
+    a1 = fa.record_failure("t", "boom", "trace")
+    a2 = fa.record_failure("t", "boom", "trace", run_id="99")
+    assert len(store.chunks) == 1                  # collapsed, not duplicated
+    assert a2.occurrences == 2
+    assert a2.first_seen == a1.first_seen           # first_seen preserved
+    assert store.chunks[a2.failure_id].metadata["run_id"] == "99"   # latest run wins
+
+
+def test_different_error_is_distinct_failure():
+    store = FakeFailureStore()
+    fa = _analyzer(store)
+    fa.record_failure("t", "boom A", "")
+    fa.record_failure("t", "boom B", "")
+    assert len(store.chunks) == 2
+
+
+def test_annotate_sets_and_preserves_root_cause():
+    store = FakeFailureStore()
+    fa = _analyzer(store)
+    art = fa.record_failure("t", "boom", "trace")
+    assert fa.annotate(art.failure_id, root_cause="race condition", fix_commit="abc123")
+    got = fa.get_failure(art.failure_id)
+    assert got.root_cause == "race condition" and got.fix_commit == "abc123"
+    again = fa.record_failure("t", "boom", "trace", run_id="2")   # recurrence
+    assert again.root_cause == "race condition" and again.occurrences == 2
+
+
+def test_annotate_unknown_failure_returns_false():
+    assert _analyzer().annotate("fail_nope", root_cause="x") is False
+
+
+def test_find_similar_respects_threshold():
+    store = FakeFailureStore(score=0.9)
+    fa = _analyzer(store, threshold=0.85)
+    fa.record_failure("t", "TimeoutError on checkout", "trace")
+    assert fa.find_similar("Timeout clicking checkout")        # 0.9 >= 0.85 -> hit
+    store.score = 0.50
+    assert fa.find_similar("totally unrelated") == []          # 0.50 < 0.85 -> gated
+    assert fa.find_similar("x", min_similarity=0.4)            # explicit override
+
+
+def test_find_similar_empty_store():
+    assert _analyzer().find_similar("anything") == []
+
+
+def test_failure_stats_ranks_recurring():
+    store = FakeFailureStore()
+    fa = _analyzer(store)
+    for _ in range(3):
+        fa.record_failure("flaky", "boom", "t")     # x3
+    fa.record_failure("rare", "bang", "t")           # x1
+    s = fa.stats()
+    assert s["total_failures"] == 2 and s["total_occurrences"] == 4
+    assert s["top_recurring"][0]["test_name"] == "flaky"
+    assert s["top_recurring"][0]["occurrences"] == 3
+
+
+def test_failure_authority_is_lowest():
+    assert authority_for("Failure") == 10
+    assert authority_for("Failure") < authority_for("Test_Case")
+
+
+def test_failure_category_registered():
+    from models import CATEGORIES
+    assert "Failure" in CATEGORIES
 
 
 def test_review_http_round_trip():

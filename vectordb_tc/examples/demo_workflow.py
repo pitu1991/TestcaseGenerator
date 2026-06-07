@@ -20,6 +20,7 @@ from conflict import ConflictDetector
 from config import AppConfig
 from delta import DeltaEngine
 from embedder import EmbeddingService
+from failure import FailureAnalyzer
 from governance import GovernanceStore
 from ingestion import IngestionPipeline
 from notifier import LogNotifier
@@ -39,7 +40,8 @@ def main() -> None:
 
     cfg = AppConfig(project_root=str(root), chunk_size=200, chunk_overlap=40,
                     pii_guard=False, conflict_detection=True,
-                    conflict_similarity_threshold=0.7)
+                    conflict_similarity_threshold=0.7,
+                    failure_similarity_threshold=0.6)
     embedder = EmbeddingService(cfg.embedding_model)
     store = ChromaStore(cfg.chromadb_path)
     gov = GovernanceStore(cfg.governance_db_path)
@@ -49,6 +51,7 @@ def main() -> None:
                              embedder, store, conflict_detector=detector)
     retr = RetrievalEngine(embedder, store, cfg)
     delta = DeltaEngine(store)
+    failures = FailureAnalyzer(embedder, store, cfg)
 
     # ---- Phase A: versioning ------------------------------------------------
     banner("PHASE A  Versioning (Option B: keep history, is_latest)")
@@ -127,6 +130,32 @@ def main() -> None:
     print("ReviewService.list_html() produces a table of conflicts, e.g.:")
     print(f"  conflicts in DB: {len(gov.get_conflicts())}")
     print("  (launch live with the start_review_ui MCP tool -> http://127.0.0.1:8765/)")
+
+    # ---- Phase E: failure intelligence -------------------------------------
+    banner("PHASE E  Failure intelligence (recurring-failure memory)")
+    err = "TimeoutError: locator.click on #checkout-btn timed out after 30000ms"
+    failures.record_failure("test_checkout_flow", err, "at checkout.spec.ts:42",
+                            run_id="build-100", project="web")
+    again = failures.record_failure("test_checkout_flow", err, "at checkout.spec.ts:42",
+                                    run_id="build-101", project="web")
+    print(f"Same failure seen twice -> one record, occurrences={again.occurrences} "
+          f"(id={again.failure_id})")
+    failures.annotate(again.failure_id,
+                      root_cause="checkout button hidden behind cookie-consent overlay",
+                      fix_commit="a1b2c3d")
+    print("Engineer triaged it -> root cause + fix commit annotated.\n")
+
+    new_error = "checkout button does not respond to click, test times out"
+    print(f"NEW red build, different wording: {new_error!r}")
+    matches = failures.find_similar(new_error, project="web")
+    if matches:
+        art, sim = matches[0]
+        print(f"  -> matched past failure (similarity {sim:.3f}):")
+        print(f"     root cause: {art.root_cause}")
+        print(f"     fix commit: {art.fix_commit}  (seen {art.occurrences}x)")
+    print("  NOTE: deterministic similarity only; the host IDE LLM turns this "
+          "history into a root-cause hypothesis.")
+    print(f"\nFailure stats: {failures.stats(project='web')}")
 
     print(f"\nDemo store + db left in: {root}\n(delete it when done)")
 

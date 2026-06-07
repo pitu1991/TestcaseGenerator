@@ -35,6 +35,7 @@ from conflict import ConflictDetector
 from delta import DeltaEngine
 from governance import GovernanceStore
 from store import ChromaStore
+from failure import FailureAnalyzer
 from ingestion import IngestionPipeline
 from retrieval import RetrievalEngine
 from exporter import ExcelExporter
@@ -321,3 +322,35 @@ def test_conflict_detection_and_resolution_end_to_end(embedder, tmp_project):
 
     top = retr.search("is OTP validation required for login", top_k=5, authority_boost=True)
     assert top and top[0].chunk.category == "Business_Resolution"
+
+
+def test_failure_intelligence_end_to_end(embedder, tmp_project):
+    """Phase E against real embeddings + ChromaDB: a recurring failure collapses
+    onto one record, a new differently-worded error retrieves the triaged root
+    cause, and an unrelated error does not match at a high threshold."""
+    root = tmp_project / "failure_run"
+    root.mkdir()
+    cfg = AppConfig(project_root=str(root), failure_similarity_threshold=0.6)
+    store = ChromaStore(str(root / "vectordb-data"))
+    fa = FailureAnalyzer(embedder, store, cfg)
+
+    err = "TimeoutError: locator.click on #checkout-btn timed out"
+    fa.record_failure("test_checkout", err, "at checkout.spec.ts:42",
+                      run_id="100", project="web")
+    again = fa.record_failure("test_checkout", err, "at checkout.spec.ts:42",
+                              run_id="101", project="web")
+    assert again.occurrences == 2                       # recurrence collapsed onto one id
+
+    fa.annotate(again.failure_id,
+                root_cause="checkout button hidden behind cookie banner",
+                fix_commit="a1b2c3d")
+
+    matches = fa.find_similar("checkout button click times out", project="web")
+    assert matches, "a similar past failure should be found"
+    art, _sim = matches[0]
+    assert "cookie banner" in art.root_cause and art.fix_commit == "a1b2c3d"
+    assert art.occurrences == 2
+
+    unrelated = fa.find_similar("AssertionError: expected 200 got 500 on /api/users",
+                                min_similarity=0.85, project="web")
+    assert unrelated == []

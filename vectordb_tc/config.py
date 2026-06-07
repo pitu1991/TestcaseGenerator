@@ -40,6 +40,10 @@ class AppConfig:
     conflict_similarity_threshold: float = 0.83   # cosine score to flag a candidate
     project_id: str = "default"                    # multi-project scoping for conflicts
 
+    # Failure intelligence (Phase E). Cosine score above which a new failure is
+    # treated as "the same as" a past one when surfacing root cause / fix.
+    failure_similarity_threshold: float = 0.85
+
     log_level: str = "INFO"
     log_file: str = "vectordb-server.log"
 

@@ -68,7 +68,7 @@ Config: pytest.ini sets python_classes = *Tests for test discovery.
 python vectordb_tc/server.py
 ```
 
-The server exposes 19 MCP tools (Phases A–D).
+The server exposes 23 MCP tools (Phases A–E).
 
 ### Kiro MCP Wiring
 
@@ -118,13 +118,14 @@ Defines all data classes shared across the system:
 - TestCase / TestStep: output test case structure
 - ValidationResult / ValidationError: export validation report
 - IngestionResult: result of a single file/epic ingest
-- Category: enum of knowledge types (MOM, UI_Flow, Error_Code, Business_Rule, Q_and_A, Story, Test_Case, Business_Resolution)
-- ConflictRecord / ResolutionArtifact (Phase C governance); DocumentDelta / DeltaSection (Phase B); AUTHORITY_DEFAULTS map + authority_for() (Business_Resolution=100 down to MOM/Q_and_A=40)
+- Category: enum of knowledge types (MOM, UI_Flow, Error_Code, Business_Rule, Q_and_A, Story, Test_Case, Business_Resolution, Failure)
+- ConflictRecord / ResolutionArtifact (Phase C governance); DocumentDelta / DeltaSection (Phase B); FailureArtifact (Phase E); AUTHORITY_DEFAULTS map + authority_for() (Business_Resolution=100 down to MOM/Q_and_A=40, Failure=10 lowest so failures never ground generation)
 
 #### config.py — Configuration Management
 - AppConfig: dataclass with YAML/JSON loader; all paths derive from project_root
 - Defaults: embedding_model=BAAI/bge-small-en-v1.5, chunk_size=400, token_budget=35000, pii_guard=True
 - Versioning/governance: max_versions_retained=0 (unlimited), conflict_detection=False, conflict_similarity_threshold=0.83, project_id="default"; governance_db_path derives to {project_root}/governance.db
+- Failure intelligence (Phase E): failure_similarity_threshold=0.85 (cosine cutoff for "same as a past failure")
 - Lazy import of pyyaml (JSON-only setups don't require it)
 
 #### embedder.py — Sentence-Transformers Wrapper
@@ -209,13 +210,21 @@ Defines all data classes shared across the system:
 #### review_app.py — Human-in-the-Loop Review UI (Phase D)
 - stdlib `http.server`, localhost-only, no auth. ReviewService holds all (unit-tested, socket-free) logic; the HTTP handler is a thin adapter. resolve_fn/verdict_fn are injected to decouple from ingestion/governance. Launched via the `start_review_ui` MCP tool on a daemon thread.
 
+#### failure.py — Failure Intelligence (Phase E)
+- FailureAnalyzer: stores test failures as searchable memory so recurring failures are diagnosed instantly instead of re-debugged. Local-first (same embedder + ChromaStore; no Astra/OpenAI/LangChain).
+- **One vector per failure (NOT chunked):** a failure is atomic; fragmenting a stack trace would split the similarity signal. Each failure is a single `Failure` chunk written directly via `store.upsert_chunks` (bypasses `_store_versioned`).
+- **Embedding key = error signature** (test_name + error_message + stack_trace, trace tail bounded ~2 KB). `root_cause`/`fix_commit`/`assignee` are metadata-only annotations (never folded into the vector — a stale annotation can't drift the search key).
+- **Idempotent + recurrence-aware:** `failure_id = "fail_" + sha256(signature)[:12]`; re-recording an identical failure bumps `occurrences`, preserves `first_seen` + annotations. Authority 10 (lowest) → failures never pollute `gather_test_context` or outrank real knowledge. See [docs/failure_intelligence_flow.md](vectordb_tc/docs/failure_intelligence_flow.md).
+- CI hook: `examples/ingest_failures.py` parses JUnit XML (stdlib; works for pytest/Playwright/JUnit/Cypress) — `ingest` / `query` / `stats` subcommands against the same ChromaDB the server reads.
+
 #### server.py — FastMCP Entry Point
-- Wires 8 tools and returns STRUCTURED errors (empty KB, Jira unavailable, validation failures)
-- Globals: CONFIG, EMBEDDER, STORE, CHUNKER, GOVERNANCE, DETECTOR, INGEST, RETRIEVE, DELTA, EXPORTER, VALIDATOR
+- Wires 23 tools and returns STRUCTURED errors (empty KB, Jira unavailable, validation failures)
+- Globals: CONFIG, EMBEDDER, STORE, CHUNKER, GOVERNANCE, DETECTOR, INGEST, RETRIEVE, DELTA, FAILURES, EXPORTER, VALIDATOR
 - Core tools: ingest_documents, ingest_jira_stories, search_knowledge, gather_test_context, export_test_cases, get_ingestion_status, list_stories_without_tests, remove_source, migrate_versioning
 - Delta (Phase B): get_document_versions, search_delta_changes, gather_delta_context
 - Governance (Phase C): get_conflicts, get_conflict_candidates, record_conflict_verdict, resolve_conflict, search_authoritative_knowledge, search_unresolved_conflicts
 - Review UI (Phase D): start_review_ui (launches the localhost review app on a daemon thread)
+- Failure intelligence (Phase E): record_failure, find_similar_failures, annotate_failure, get_failure_stats
 - **`migrate_versioning` is a one-time, idempotent backfill** (`STORE.backfill_versioning()`) that stamps `version`/`is_latest`/`document_id`/`chunk_hash` on pre-Phase-A chunks. Run it once after upgrading, BEFORE relying on `is_latest` filtering — otherwise un-stamped chunks (missing the field) get filtered out and retrieval returns empty.
 - **Two-tool workflow:** `gather_test_context` appends an `instruction_block` and `template_spec` to its JSON response telling the host LLM to produce test cases and then call `export_test_cases`. This is how the server directs generation without doing it itself — the instruction is baked into the tool response, not into a system prompt.
 

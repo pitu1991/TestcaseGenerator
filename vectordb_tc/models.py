@@ -16,13 +16,16 @@ from typing import Literal
 # Single source of truth for categories. Test_Case was missing in the design.
 # Business_Resolution (Phase C) is the authoritative artifact a human approves to
 # settle a conflict; it outranks every source category during retrieval.
+# Failure (Phase E) is a diagnostic test-failure artifact (error + stack trace),
+# stored for similarity-based recurring-failure analysis — deliberately low
+# authority so it never grounds test-case generation.
 Category = Literal[
     "MOM", "UI_Flow", "Error_Code", "Business_Rule", "Q_and_A", "Story", "Test_Case",
-    "Business_Resolution",
+    "Business_Resolution", "Failure",
 ]
 CATEGORIES: tuple[str, ...] = (
     "MOM", "UI_Flow", "Error_Code", "Business_Rule", "Q_and_A", "Story", "Test_Case",
-    "Business_Resolution",
+    "Business_Resolution", "Failure",
 )
 
 CaseType = Literal["positive", "negative", "edge"]
@@ -35,6 +38,7 @@ AUTHORITY_DEFAULTS: dict[str, int] = {
     "UI_Flow": 70, "Error_Code": 70,
     "Test_Case": 60,
     "MOM": 40, "Q_and_A": 40,
+    "Failure": 10,   # diagnostic only; must never outrank real knowledge
 }
 
 
@@ -185,6 +189,29 @@ class ResolutionArtifact:
     effective_date: str
     created_at: str
     resolution_chunk_id: str = ""   # document_id of the re-ingested resolution chunk
+
+
+@dataclass
+class FailureArtifact:
+    """A stored test-failure record (Phase E). The embedding is built from the
+    error signature (test_name + error_message + stack_trace); root_cause / fix /
+    assignee are human annotations attached after triage, kept as metadata so the
+    error signature stays the search key. Identical failures collapse onto one
+    failure_id and bump `occurrences` rather than creating duplicates."""
+    failure_id: str            # "fail_{sig_hash[:12]}" — stable across recurrences
+    test_name: str
+    error_message: str
+    stack_trace: str = ""
+    run_id: str = ""           # CI run / build id of the most recent occurrence
+    status: str = "failed"     # failed | error | flaky
+    screenshot_path: str = ""  # local path or object-store URL (blob lives elsewhere)
+    project: str = "default"
+    root_cause: str = ""       # filled after triage
+    fix_commit: str = ""       # commit that resolved it
+    assignee: str = ""
+    occurrences: int = 1
+    first_seen: str = ""       # ISO 8601
+    last_seen: str = ""        # ISO 8601
 
 
 @dataclass

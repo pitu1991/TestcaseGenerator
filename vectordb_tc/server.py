@@ -1,5 +1,5 @@
-"""FastMCP entry point. Wires the 8 tools and returns STRUCTURED errors the host
-LLM can act on (empty KB, Jira unavailable, validation failures)."""
+"""FastMCP entry point. Wires the MCP tools (Phases A-E) and returns STRUCTURED
+errors the host LLM can act on (empty KB, Jira unavailable, validation failures)."""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,7 @@ from conflict import ConflictDetector
 from delta import DeltaEngine
 from embedder import EmbeddingService
 from exporter import ExcelExporter
+from failure import FailureAnalyzer
 from governance import GovernanceStore
 from ingestion import IngestionPipeline
 from models import AcceptanceCriterion, TestCase, TestStep
@@ -31,6 +32,7 @@ DETECTOR = ConflictDetector(STORE, GOVERNANCE, CONFIG.conflict_similarity_thresh
 INGEST = IngestionPipeline(CONFIG, CHUNKER, EMBEDDER, STORE, conflict_detector=DETECTOR)
 RETRIEVE = RetrievalEngine(EMBEDDER, STORE, CONFIG)
 DELTA = DeltaEngine(STORE)
+FAILURES = FailureAnalyzer(EMBEDDER, STORE, CONFIG)
 EXPORTER = ExcelExporter()
 VALIDATOR = ExportValidator()
 
@@ -320,6 +322,51 @@ def search_unresolved_conflicts() -> str:
     chunks = STORE.get_chunks_by_ids(ids)
     return json.dumps([{"chunk_id": c.id, "text": c.text, "source_path": c.source_path,
                         "category": c.category} for c in chunks])
+
+
+@mcp.tool()
+def record_failure(test_name: str, error_message: str, stack_trace: str = "",
+                   run_id: str = "", status: str = "failed", screenshot_path: str = "",
+                   project: str = "default") -> str:
+    """Store a test failure (Phase E) as searchable memory. Identical failures
+    collapse onto one failure_id and increment 'occurrences' (the recurrence
+    signal). The error signature (test_name + error_message + stack_trace) is what
+    later failures are matched against. Returns the stored FailureArtifact."""
+    art = FAILURES.record_failure(test_name, error_message, stack_trace, run_id,
+                                  status, screenshot_path, project)
+    return json.dumps(asdict(art))
+
+
+@mcp.tool()
+def find_similar_failures(error_text: str, top_k: int = 3,
+                          min_similarity: float | None = None,
+                          project: str | None = None) -> str:
+    """The failure analyzer: given a NEW error, return the most similar past
+    failures (above the similarity threshold) with their triaged root_cause /
+    fix_commit / assignee so a recurring failure is diagnosed instantly instead of
+    re-debugged. Empty list means no strong match — manual triage needed."""
+    matches = FAILURES.find_similar(error_text, top_k=top_k,
+                                    min_similarity=min_similarity, project=project)
+    return json.dumps([{"similarity": sim, **asdict(art)} for art, sim in matches])
+
+
+@mcp.tool()
+def annotate_failure(failure_id: str, root_cause: str = "", fix_commit: str = "",
+                     assignee: str = "") -> str:
+    """Attach triage outcome to a stored failure after it is fixed (keeps the
+    memory fresh: an un-updated store gives false confidence). Metadata-only — does
+    not change the search vector. Returns {updated: bool}."""
+    ok = FAILURES.annotate(failure_id, root_cause, fix_commit, assignee)
+    if not ok:
+        return _err("not_found", f"No failure with id {failure_id}")
+    return json.dumps({"updated": True, "failure_id": failure_id})
+
+
+@mcp.tool()
+def get_failure_stats(project: str | None = None) -> str:
+    """Failure-memory summary: total distinct failures, total occurrences, and the
+    top recurring failures (chronic offenders to fix first)."""
+    return json.dumps(FAILURES.stats(project=project))
 
 
 @mcp.tool()

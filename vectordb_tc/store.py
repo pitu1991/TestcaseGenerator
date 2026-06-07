@@ -159,9 +159,33 @@ class ChromaStore:
             self._col.update(ids=up_ids, metadatas=up_metas)
         return len(up_ids)
 
+    def update_chunk_metadata(self, chunk_id: str, updates: dict) -> bool:
+        """Merge `updates` into one chunk's metadata (no re-embed). Used by the
+        failure analyzer to attach root_cause/fix_commit after triage. Returns
+        False if the chunk does not exist. None values are ignored."""
+        r = self._col.get(ids=[chunk_id], include=["metadatas"])
+        metas = r.get("metadatas") or []
+        if not metas:
+            return False
+        mm = dict(metas[0])
+        mm.update({k: v for k, v in updates.items() if v is not None})
+        self._col.update(ids=[chunk_id], metadatas=[mm])
+        return True
+
     def stored_model_versions(self) -> set[str]:
         r = self._col.get(include=["metadatas"])
         return {m.get("model_version", "") for m in (r.get("metadatas") or [])}
+
+    def chunks_by_category(self, category: str, where_extra: dict | None = None) -> list[Chunk]:
+        """All chunks in a category (optionally narrowed by extra metadata equality,
+        e.g. {'failure_project': 'web'}). Used by failure-stats aggregation."""
+        if where_extra:
+            where = {"$and": [{"category": category}] + [{k: v} for k, v in where_extra.items()]}
+        else:
+            where = {"category": category}
+        r = self._col.get(where=where, include=["documents", "metadatas"])
+        return [self._chunk(cid, doc, meta) for cid, doc, meta in
+                zip(r.get("ids", []), r.get("documents") or [], r.get("metadatas") or [])]
 
     def issue_keys_by_category(self, category: str) -> set[str]:
         r = self._col.get(where={"category": category}, include=["metadatas"])
